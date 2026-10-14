@@ -18,21 +18,25 @@
 //   HERDR_OMP_IDLE_DEBOUNCE_MS      idle debounce, default 250
 //   HERDR_OMP_BRIDGE_METADATA=0     disable pane.report_metadata
 //   HERDR_OMP_BRIDGE_HEARTBEAT_MS  periodic full re-report, default 30000 (0 = off);
-//                                   herdr's agent state decays without re-assertion
-//   HERDR_OMP_BRIDGE_DISPLAY_NAME   display_agent shown in herdr UI, default "ompg"
-//                                    (set 0 to keep the authoritative "omp" label visible)
+//                                   restores tracking after a herdr server restart
 //   HERDR_OMP_BRIDGE_LOG=1          verbose logging for debugging
 
 import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import net from "node:net";
 
-const SOURCE = "herdr:omp";
-const AGENT = "omp";
+// Naming per herdr's add-herdr-support guide: the "herdr:" source prefix is
+// reserved for herdr's own integrations — reports under it are accepted but
+// silently ignored (verified on 0.9.4: exit 0, no pane state change), and
+// `agent` must be our own name, not one herdr already supports. The agent
+// name is also what the sidebar displays.
+const SOURCE = "custom:ompg-bridge";
+const AGENT = "ompg";
 const SEND_TIMEOUT_MS = 500;
 const SEND_RETRY_TIMEOUT_MS = 1500;
 const RESYNC_BACKOFF_MS = [1000, 2000, 5000, 10000] as const;
-// herdr treats agent state as stale without periodic re-assertion; a
-// mid-task agent that never transitions would otherwise decay to "unknown".
+// Keeps tracking alive across a herdr server restart: the restored pane has
+// no agent until this source re-reports, which otherwise only happens at the
+// next state transition.
 const DEFAULT_HEARTBEAT_MS = 30_000;
 
 type AgentState = "idle" | "working" | "blocked";
@@ -76,10 +80,6 @@ export default function herdrOmpgBridge(pi: ExtensionAPI, env: NodeJS.ProcessEnv
 	const verbose = env.HERDR_OMP_BRIDGE_LOG === "1";
 	const idleDebounceMs = envInt(env, "HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
 	const heartbeatMs = envInt(env, "HERDR_OMP_BRIDGE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS);
-	// display_agent is a display-only override (metadata); the authoritative
-	// agent label stays "omp" so herdr keeps its built-in omp semantics.
-	const configuredDisplayName = env.HERDR_OMP_BRIDGE_DISPLAY_NAME ?? "ompg";
-	const displayName = configuredDisplayName === "0" ? "" : configuredDisplayName;
 	const endpoint = process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 	const enabled = env.HERDR_ENV === "1" && !!socketPath && !!paneId && env.OMPCODE !== "1";
 
@@ -372,14 +372,13 @@ export default function herdrOmpgBridge(pi: ExtensionAPI, env: NodeJS.ProcessEnv
 			/* usage unavailable */
 		}
 		if (stopped || runtimeOff || revision !== metadataRevision) return true;
-		if (Object.keys(tokens).length === 0 && !displayName) return true;
+		if (Object.keys(tokens).length === 0) return true;
 		const params: Record<string, unknown> = {
 			pane_id: paneId,
 			source: SOURCE,
 			seq: nextSeq(),
 			agent: AGENT,
 		};
-		if (displayName) params.display_agent = displayName;
 		if (Object.keys(tokens).length > 0) params.tokens = tokens;
 		return enqueue("pane.report_metadata", params);
 	}
@@ -405,9 +404,10 @@ export default function herdrOmpgBridge(pi: ExtensionAPI, env: NodeJS.ProcessEnv
 		// a live agent between turns; a fresh session is idle anyway).
 		if (ctx.isIdle?.() === false) agentActive = true;
 		recomputeDesired();
-		void reportSession(currentSessionSource)
-			.then(() => publishState(true))
-			.then(() => reportMetadata());
+		// State report first: herdr grants pane authority via pane.report_agent,
+		// and resume_argv on a session report fails with resume_not_accepted
+		// until this source holds the pane.
+		void publishState(true).then(() => reportSession(currentSessionSource)).then(() => reportMetadata());
 		// Heartbeat: herdr's agent state decays without periodic re-assertion,
 		// and a herdr restart mid-task would otherwise never be noticed (no
 		// transitions → no sends → no failures detected).
@@ -625,7 +625,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI, env: NodeJS.ProcessEnv
 					`state: ${desired.state}${desired.message ? ` (${desired.message})` : ""}`,
 					`delivered: ${lastDelivered ? `${lastDelivered.state}${lastDelivered.message ? ` (${lastDelivered.message})` : ""}` : "never"}`,
 					`last error: ${lastError || "none"}`,
-					`metadata: ${metadataEnabled ? "on" : "off"}  display: ${displayName || "(default)"}  heartbeat: ${heartbeatMs || "off"}ms`,
+					`metadata: ${metadataEnabled ? "on" : "off"}  heartbeat: ${heartbeatMs || "off"}ms`,
 				];
 				notify(lines.join("\n"));
 			},

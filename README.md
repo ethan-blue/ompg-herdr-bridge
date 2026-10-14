@@ -71,10 +71,13 @@ Or manually: copy `herdr-ompg-bridge.ts` into `<config-dir>/agent/extensions/`.
 |---|---|---|
 | `HERDR_OMP_BRIDGE_FORCE` | `0` | Activate even in headless/print mode (testing) |
 | `HERDR_OMP_IDLE_DEBOUNCE_MS` | `250` | Idle debounce window (same name as the bundled integration) |
-| `HERDR_OMP_BRIDGE_HEARTBEAT_MS` | `30000` | Periodic full re-report (session + state + metadata). herdr's agent state decays without re-assertion, and a herdr restart mid-task is otherwise only noticed at the next state transition. `0` disables |
+| `HERDR_OMP_BRIDGE_HEARTBEAT_MS` | `30000` | Periodic full re-report (session + state + metadata). Keeps tracking alive across a herdr server restart, which is otherwise only noticed at the next state transition. `0` disables |
 | `HERDR_OMP_BRIDGE_METADATA` | `1` | Set `0` to disable `pane.report_metadata` |
-| `HERDR_OMP_BRIDGE_DISPLAY_NAME` | `ompg` | `display_agent` shown in the herdr UI. The authoritative agent label stays `omp` (herdr's built-in semantics); set `0` to show `omp` instead |
 | `HERDR_OMP_BRIDGE_LOG` | `0` | Verbose logging |
+
+## Naming (important)
+
+The bridge reports `source: custom:ompg-bridge` and `agent: ompg`. Per [herdr's add-herdr-support guide](https://herdr.dev/docs/add-herdr-support/), a third-party reporter must not use the `herdr:` source prefix — it is reserved for herdr's own integrations, and reports under it are accepted but **silently ignored** (verified on 0.9.4). Likewise, `agent` must be the reporter's own name, not one herdr already supports. The `agent` name is what the sidebar displays.
 
 ## Offline test (no herdr needed)
 
