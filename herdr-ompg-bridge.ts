@@ -62,30 +62,28 @@ interface BridgeContext {
 	};
 }
 
-function envInt(name: string, fallback: number): number {
-	const raw = process.env[name];
+function envInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+	const raw = env[name];
 	if (!raw) return fallback;
 	const n = Number.parseInt(raw, 10);
 	return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-export default function herdrOmpgBridge(pi: ExtensionAPI): void {
+export default function herdrOmpgBridge(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
 	const log = pi.logger;
-	const env = process.env;
 	const socketPath = env.HERDR_SOCKET_PATH;
 	const paneId = env.HERDR_PANE_ID;
 	const force = env.HERDR_OMP_BRIDGE_FORCE === "1";
 	const metadataEnabled = env.HERDR_OMP_BRIDGE_METADATA !== "0";
 	const verbose = env.HERDR_OMP_BRIDGE_LOG === "1";
-	const idleDebounceMs = envInt("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
-	const heartbeatMs = envInt("HERDR_OMP_BRIDGE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS);
+	const idleDebounceMs = envInt(env, "HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
+	const heartbeatMs = envInt(env, "HERDR_OMP_BRIDGE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS);
 	// display_agent is a display-only override (metadata); the authoritative
 	// agent label stays "omp" so herdr keeps its built-in omp semantics.
-	const displayName = env.HERDR_OMP_BRIDGE_DISPLAY_NAME ?? "ompg";
-	const endpoint =
-		process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
-	const enabled =
-		env.HERDR_ENV === "1" && !!socketPath && !!paneId && env.OMPCODE !== "1";
+	const configuredDisplayName = env.HERDR_OMP_BRIDGE_DISPLAY_NAME ?? "ompg";
+	const displayName = configuredDisplayName === "0" ? "" : configuredDisplayName;
+	const endpoint = process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
+	const enabled = env.HERDR_ENV === "1" && !!socketPath && !!paneId && env.OMPCODE !== "1";
 
 	if (!enabled) {
 		log.info("herdr-ompg-bridge: inactive (HERDR_ENV/HERDR_SOCKET_PATH/HERDR_PANE_ID not set)");
@@ -97,49 +95,88 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------
 	let reportSeq = Date.now() * 1000;
 	let requestSeq = 0;
+	let stopped = false;
+	let metadataRevision = 0;
+	const inFlight = new Set<net.Socket>();
 
 	function nextSeq(): number {
 		return ++reportSeq;
 	}
 
 	function send(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<boolean> {
+		if (stopped || runtimeOff) return Promise.resolve(false);
 		const request = {
 			id: `herdr:omp:bridge:${Date.now()}:${++requestSeq}`,
 			method,
 			params,
 		};
-		return new Promise(resolve => {
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		{
 			let settled = false;
+			let socket: net.Socket | undefined;
+			let timer: NodeJS.Timeout | undefined;
+			let buffer = "";
 			const finish = (ok: boolean) => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
-				try { socket.destroy(); } catch { /* already closed */ }
+				if (socket) inFlight.delete(socket);
+				try {
+					socket?.destroy();
+				} catch {
+					/* already closed */
+				}
 				resolve(ok);
 			};
-			const timer = setTimeout(() => finish(false), timeoutMs);
-			const socket = net.createConnection(endpoint, () => {
-				socket.write(JSON.stringify(request) + "\n");
-			});
-			socket.on("data", () => finish(true));
-			socket.on("error", () => finish(false));
-			socket.on("close", () => finish(false));
-		});
+			timer = setTimeout(() => finish(false), timeoutMs);
+			try {
+				socket = net.createConnection(endpoint, () => {
+					socket?.write(JSON.stringify(request) + "\n");
+				});
+				inFlight.add(socket);
+				socket.setEncoding("utf8");
+				socket.on("data", chunk => {
+					buffer += chunk;
+					const newline = buffer.indexOf("\n");
+					if (newline < 0) return;
+					try {
+						const response: unknown = JSON.parse(buffer.slice(0, newline));
+						finish(
+							typeof response === "object" &&
+								response !== null &&
+								"id" in response &&
+								response.id === request.id &&
+								"result" in response &&
+								!("error" in response),
+						);
+					} catch {
+						finish(false);
+					}
+				});
+				socket.on("error", () => finish(false));
+				socket.on("close", () => finish(false));
+			} catch {
+				finish(false);
+			}
+		}
+		return promise;
 	}
 
 	// Serial delivery with per-request retry; tracks health for resync.
-	const sendQueue: Promise<void> = Promise.resolve();
+	let sendQueue: Promise<void> = Promise.resolve();
 	let healthy = true;
 	let failureNotified = false;
 	let lastError = "";
 
 	function enqueue(method: string, params: Record<string, unknown>): Promise<boolean> {
 		const run = sendQueue.then(async () => {
-			const ok = (await send(method, params, SEND_TIMEOUT_MS))
-				|| (await send(method, params, SEND_RETRY_TIMEOUT_MS));
+			if (stopped || runtimeOff) return false;
+			const ok =
+				(await send(method, params, SEND_TIMEOUT_MS)) || (await send(method, params, SEND_RETRY_TIMEOUT_MS));
+			if (stopped || runtimeOff) return false;
 			healthy = ok;
 			if (!ok) {
-				lastError = `${method} failed (pipe unreachable)`;
+				lastError = `${method} failed (request not acknowledged)`;
 				if (!failureNotified) {
 					failureNotified = true;
 					log.warn(`herdr-ompg-bridge: ${lastError}; will retry in background`);
@@ -153,12 +190,11 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 			return ok;
 		});
 		// Keep the chain alive even when a step rejects (it never does; send resolves).
-		sendQueueSpin(run);
+		sendQueue = run.then(
+			() => {},
+			() => {},
+		);
 		return run;
-	}
-
-	function sendQueueSpin(p: Promise<boolean>): void {
-		void p.catch(() => {});
 	}
 
 	// ------------------------------------------------------------------
@@ -166,12 +202,12 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	// full report set (session + state + metadata) so a herdr restart
 	// never leaves the pane stuck on a stale state.
 	// ------------------------------------------------------------------
-	let resyncTimer: ReturnType<typeof setTimeout> | undefined;
+	let resyncTimer: NodeJS.Timeout | undefined;
 	let resyncAttempt = 0;
-	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	let heartbeatTimer: NodeJS.Timeout | undefined;
 
 	function scheduleResync(): void {
-		if (resyncTimer) return;
+		if (stopped || runtimeOff || resyncTimer) return;
 		const delay = RESYNC_BACKOFF_MS[Math.min(resyncAttempt, RESYNC_BACKOFF_MS.length - 1)];
 		resyncTimer = setTimeout(() => {
 			resyncTimer = undefined;
@@ -192,8 +228,8 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		const sessionOk = await reportSession(currentSessionSource);
 		const stateOk = await publishState(true);
 		const metaOk = metadataEnabled ? await reportMetadata() : true;
-		const ok = stateOk && (metaOk || !metadataEnabled);
-		void sessionOk;
+		const ok = sessionOk && stateOk && metaOk;
+		healthy = ok;
 		return ok;
 	}
 
@@ -205,7 +241,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	let blockedMessage = "";
 	let retryPending = 0;
 	let agentActive = false;
-	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+	let idleTimer: NodeJS.Timeout | undefined;
 	let lastDelivered: { state: AgentState; message: string } | undefined;
 	let desired: { state: AgentState; message: string } = { state: "idle", message: "" };
 
@@ -238,13 +274,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	async function publishState(force = false): Promise<boolean> {
 		if (runtimeOff) return true;
 		const { state, message } = desired;
-		if (
-			!force
-			&& lastDelivered
-			&& lastDelivered.state === state
-			&& lastDelivered.message === message
-			&& healthy
-		) {
+		if (!force && lastDelivered && lastDelivered.state === state && lastDelivered.message === message && healthy) {
 			return true;
 		}
 		const params: Record<string, unknown> = {
@@ -281,7 +311,9 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 			if (file) ref.agent_session_path = file;
 			const id = sm?.getSessionId?.();
 			if (id) ref.agent_session_id = id;
-		} catch { /* session not ready yet */ }
+		} catch {
+			/* session not ready yet */
+		}
 		return ref;
 	}
 
@@ -316,23 +348,32 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 
 	async function reportMetadata(): Promise<boolean> {
 		if (runtimeOff || !metadataEnabled) return true;
-		const tokens: Record<string, string> = {};
+		const revision = ++metadataRevision;
+		const context = activeCtx;
+		const model = activeModel;
+		const tokens: Record<string, string | null> = { model: null, thinking: null, context: null };
 		try {
-			const model = activeModel;
 			if (model?.id) tokens.model = model.id;
-		} catch { /* model unavailable */ }
+		} catch {
+			/* model unavailable */
+		}
 		try {
 			const level = await pi.getThinkingLevel?.();
 			if (level) tokens.thinking = String(level);
-		} catch { /* thinking level unavailable */ }
+		} catch {
+			/* thinking level unavailable */
+		}
 		try {
-			const usage = activeCtx?.getContextUsage?.();
+			const usage = context?.getContextUsage?.();
 			const used = usage?.contextTokens ?? usage?.usedTokens ?? usage?.tokens;
 			const window = usage?.contextWindow ?? usage?.windowTokens;
 			if (typeof used === "number" && typeof window === "number" && window > 0) {
 				tokens.context = `${formatTokens(used)}/${formatTokens(window)} (${Math.round((used / window) * 100)}%)`;
 			}
-		} catch { /* usage unavailable */ }
+		} catch {
+			/* usage unavailable */
+		}
+		if (stopped || runtimeOff || revision !== metadataRevision) return true;
 		if (Object.keys(tokens).length === 0 && !displayName) return true;
 		const params: Record<string, unknown> = {
 			pane_id: paneId,
@@ -354,7 +395,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	let activated = false;
 
 	function activate(ctx: BridgeContext): void {
-		if (activated || runtimeOff) return;
+		if (stopped || activated || runtimeOff) return;
 		if (!force && ctx.hasUI !== true) return;
 		if (ctx.agent?.kind && ctx.agent.kind !== "main") return;
 		activated = true;
@@ -365,7 +406,10 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		// Resend state after a hot reload of this extension (isIdle reflects
 		// a live agent between turns; a fresh session is idle anyway).
 		if (ctx.isIdle?.() === false) agentActive = true;
-		void reportSession(currentSessionSource).then(() => publishState(true)).then(() => reportMetadata());
+		recomputeDesired();
+		void reportSession(currentSessionSource)
+			.then(() => publishState(true))
+			.then(() => reportMetadata());
 		// Heartbeat: herdr's agent state decays without periodic re-assertion,
 		// and a herdr restart mid-task would otherwise never be noticed (no
 		// transitions → no sends → no failures detected).
@@ -385,6 +429,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	// Event wiring.
 	// ------------------------------------------------------------------
 	pi.on("session_start", (_event, ctx) => {
+		metadataRevision++;
 		currentSessionSource = "startup";
 		const ctxB = ctx as unknown as BridgeContext;
 		if (!activated) {
@@ -393,21 +438,31 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		}
 		// Already active (e.g. /new inside the same process): re-register,
 		// matching the official integration's unconditional reportSession.
+		activeCtx = ctxB;
 		activeSessionManager = ctxB.sessionManager;
 		activeModel = ctxB.model;
-		void reportSession(currentSessionSource);
+		blockedCount = 0;
+		blockedMessage = "";
+		retryPending = 0;
+		agentActive = ctxB.isIdle?.() === false;
+		clearIdleTimer();
+		transition();
+		void reportSession(currentSessionSource).then(() => reportMetadata());
 	});
 
 	pi.on("session_switch", (event, ctx) => {
+		metadataRevision++;
 		const ctxB = ctx as unknown as BridgeContext;
 		activate(ctxB);
 		if (!activated) return;
 		currentSessionSource = (event as { reason?: string })?.reason ?? "switch";
+		activeCtx = ctxB;
 		activeSessionManager = ctxB.sessionManager;
 		activeModel = ctxB.model;
 		blockedCount = 0;
+		blockedMessage = "";
 		retryPending = 0;
-		agentActive = false;
+		agentActive = ctxB.isIdle?.() === false;
 		transition();
 		void reportSession(currentSessionSource).then(() => reportMetadata());
 	});
@@ -417,7 +472,8 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		if (!activated) return;
 		// Re-register the session every turn like the official integration:
 		// herdr's agent tracking decays without periodic re-assertion.
-		activeSessionManager = (ctx as unknown as BridgeContext).sessionManager ?? activeSessionManager;
+		activeCtx = ctx as unknown as BridgeContext;
+		activeSessionManager = activeCtx.sessionManager ?? activeSessionManager;
 		void reportSession(currentSessionSource);
 		agentActive = true;
 		clearIdleTimer();
@@ -428,6 +484,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		if (!activated) return;
 		const willContinue = (event as { willContinue?: boolean })?.willContinue === true;
 		if (willContinue) return;
+		activeCtx = ctx as unknown as BridgeContext;
 		agentActive = false;
 		activeModel = (ctx as unknown as BridgeContext).model ?? activeModel;
 		// An auto-retry scheduled by OMP keeps the agent working; the
@@ -463,9 +520,11 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 			}
 			transition();
 		});
-	} catch { /* event bus unavailable */ }
+	} catch {
+		/* event bus unavailable */
+	}
 
-	pi.on("tool_approval_requested", (event) => {
+	pi.on("tool_approval_requested", event => {
 		if (!activated) return;
 		blockedCount++;
 		const e = event as { reason?: string; label?: string; toolName?: string };
@@ -481,19 +540,18 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		transition();
 	});
 
-	pi.on("tool_execution_start", (event) => {
+	pi.on("tool_execution_start", event => {
 		if (!activated) return;
 		const e = event as { toolName?: string; args?: { questions?: { question?: string }[]; question?: string } };
 		if (e?.toolName !== "ask") return;
 		blockedCount++;
-		const question = e.args?.questions?.find(q => typeof q?.question === "string")?.question
-			?? e.args?.question
-			?? "";
+		const question =
+			e.args?.questions?.find(q => typeof q?.question === "string")?.question ?? e.args?.question ?? "";
 		if (blockedCount === 1 || !blockedMessage) blockedMessage = question || "waiting for user input";
 		transition();
 	});
 
-	pi.on("tool_execution_end", (event) => {
+	pi.on("tool_execution_end", event => {
 		if (!activated) return;
 		if ((event as { toolName?: string })?.toolName !== "ask") return;
 		blockedCount = Math.max(0, blockedCount - 1);
@@ -502,7 +560,11 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", () => {
-		if (!activated) return;
+		stopped = true;
+		runtimeOff = true;
+		activated = false;
+		metadataRevision++;
+		for (const socket of inFlight) socket.destroy();
 		clearIdleTimer();
 		if (resyncTimer) {
 			clearTimeout(resyncTimer);
@@ -527,8 +589,12 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		pi.registerCommand("herdr", {
 			description: "herdr bridge: status/test/on/off",
 			handler: async (args, ctx) => {
+				if (stopped) return;
 				const ui = (ctx as unknown as BridgeContext).ui;
-				const notify = (msg: string) => ui?.notify?.(msg, { level: "info" }) ?? console.log(msg);
+				const notify = (msg: string) => {
+					if (ui?.notify) ui.notify(msg, { level: "info" });
+					else log.info(msg);
+				};
 				const sub = (args ?? "").trim().split(/\s+/)[0] ?? "";
 				if (sub === "off") {
 					runtimeOff = true;

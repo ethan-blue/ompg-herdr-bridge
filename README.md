@@ -1,6 +1,6 @@
 # ompg-herdr-bridge
 
-A community [herdr](https://herdr.dev) ↔ [omp / ompg](https://github.com/mariozechner/pi) agent-state bridge.
+A community [herdr](https://herdr.dev) ↔ [omp / ompg](https://github.com/ethan-blue/oh-my-pi) agent-state bridge.
 It replaces herdr's bundled `herdr-omp-agent-state.ts` integration for omp with a more reliable and more informative one.
 
 [中文说明](#中文说明)
@@ -16,9 +16,11 @@ herdr's bundled omp integration reports only `working / blocked / idle`, and has
 | No model / context info | Reports `pane.report_metadata` tokens: current model, thinking level, context usage (`48k/1M (5%)`) |
 | No `resume_argv` | Sends `resume_argv` (`ompg --resume=<session>`) so herdr can restore the agent session after a restart |
 | Silent failures, no introspection | Failures logged via `pi.logger`; `/herdr status` shows health, seq, last state, last error |
-| Nothing on shutdown | Best-effort terminal `idle` report on `session_shutdown` |
+| Nothing on shutdown | Cancels in-flight and queued reports so an old reporter cannot overwrite its replacement |
 
 Both integrations speak the documented [herdr socket API](https://herdr.dev/docs/socket-api/) (JSON Lines over the injected pipe/socket, `seq` ordering). This plugin is written from scratch against that API — it contains no herdr code.
+
+Delivery is serialized and succeeds only after a complete JSON Lines response with the matching request ID and a result. Error responses and unrelated IDs trigger retry. New/switch events refresh the context; unavailable metadata is cleared with `null`, and delayed metadata from an older session is discarded. These fixes address reproducible bridge defects; they do not establish the cause of every herdr UI flicker. Keep one integration reporter per pane.
 
 ## Requirements
 
@@ -76,6 +78,14 @@ Or manually: copy `herdr-ompg-bridge.ts` into `<config-dir>/agent/extensions/`.
 
 ## Offline test (no herdr needed)
 
+Run the persistent socket regression suite without a model or herdr installation:
+
+```bash
+bun test test/bridge.test.ts
+```
+
+It exercises partial acknowledgements, serial ordering, server errors, unrelated IDs, session changes, delayed metadata and shutdown using real local sockets/named pipes. A live herdr GUI and multiple-process ownership still require testing on the affected machine.
+
 ```bash
 # terminal 1: fake server that swallows the first 3 responses,
 # so you can watch the resync backoff and recovery
@@ -114,7 +124,11 @@ herdr integration install omp   # optional: restore the bundled integration
 - **重试判定走原生事件**：官方版靠英文正则匹配报错文案猜"是否在自动重试"；本插件直接订阅 omp 的 `auto_retry_start/end` 事件，与语言无关
 - **元数据上报**：通过 `pane.report_metadata` 上报当前模型、思考等级、上下文用量（如 `48k/1M (5%)`），herdr 面板可直接显示
 - **会话恢复**：上报 `resume_argv`（`ompg --resume=<会话>`），herdr 重启后能恢复 agent 会话
-- **可观测**：失败写日志；`/herdr status` 查看健康度、seq、最近错误；`/herdr test` 发合成状态验证链路；退出时发终态
+- **可观测**：失败写日志；`/herdr status` 查看健康度、seq、最近错误；`/herdr test` 发合成状态验证链路；退出时取消在途和排队报告
+- **顺序与确认**：真正串行发送，只接受完整、匹配请求 ID 的成功响应；错误或其他请求响应不再虚报成功
+- **新建与切换**：使用当前会话上下文，缺失字段显式清空，旧异步元数据不能覆盖新会话
+
+本轮为 ompg Issue #5 修复，可运行 `bun test test/bridge.test.ts` 离线验证。受影响机器的真实 herdr GUI 与多实例场景尚未验收；不把管道测试当成所有闪烁现象已经消失的证明。每个 pane 仍应只安装一个集成报告方。
 
 **安装：**
 
