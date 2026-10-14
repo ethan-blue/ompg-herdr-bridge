@@ -17,6 +17,8 @@
 //   HERDR_OMP_BRIDGE_FORCE=1        activate even without a UI (testing)
 //   HERDR_OMP_IDLE_DEBOUNCE_MS      idle debounce, default 250
 //   HERDR_OMP_BRIDGE_METADATA=0     disable pane.report_metadata
+//   HERDR_OMP_BRIDGE_HEARTBEAT_MS  periodic full re-report, default 30000 (0 = off);
+//                                   herdr's agent state decays without re-assertion
 //   HERDR_OMP_BRIDGE_DISPLAY_NAME   display_agent shown in herdr UI, default "ompg"
 //                                    (set 0 to keep the authoritative "omp" label visible)
 //   HERDR_OMP_BRIDGE_LOG=1          verbose logging for debugging
@@ -29,6 +31,9 @@ const AGENT = "omp";
 const SEND_TIMEOUT_MS = 500;
 const SEND_RETRY_TIMEOUT_MS = 1500;
 const RESYNC_BACKOFF_MS = [1000, 2000, 5000, 10000] as const;
+// herdr treats agent state as stale without periodic re-assertion; a
+// mid-task agent that never transitions would otherwise decay to "unknown".
+const DEFAULT_HEARTBEAT_MS = 30_000;
 
 type AgentState = "idle" | "working" | "blocked";
 
@@ -73,6 +78,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	const metadataEnabled = env.HERDR_OMP_BRIDGE_METADATA !== "0";
 	const verbose = env.HERDR_OMP_BRIDGE_LOG === "1";
 	const idleDebounceMs = envInt("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
+	const heartbeatMs = envInt("HERDR_OMP_BRIDGE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS);
 	// display_agent is a display-only override (metadata); the authoritative
 	// agent label stays "omp" so herdr keeps its built-in omp semantics.
 	const displayName = env.HERDR_OMP_BRIDGE_DISPLAY_NAME ?? "ompg";
@@ -162,6 +168,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------
 	let resyncTimer: ReturnType<typeof setTimeout> | undefined;
 	let resyncAttempt = 0;
+	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
 	function scheduleResync(): void {
 		if (resyncTimer) return;
@@ -356,6 +363,19 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		// a live agent between turns; a fresh session is idle anyway).
 		if (ctx.isIdle?.() === false) agentActive = true;
 		void reportSession(currentSessionSource).then(() => publishState(true)).then(() => reportMetadata());
+		// Heartbeat: herdr's agent state decays without periodic re-assertion,
+		// and a herdr restart mid-task would otherwise never be noticed (no
+		// transitions → no sends → no failures detected).
+		if (heartbeatMs > 0) {
+			heartbeatTimer = setInterval(() => {
+				if (runtimeOff) return;
+				if (!healthy) {
+					scheduleResync();
+					return;
+				}
+				void fullResync();
+			}, heartbeatMs);
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -455,6 +475,10 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 			clearTimeout(resyncTimer);
 			resyncTimer = undefined;
 		}
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = undefined;
+		}
 		blockedCount = 0;
 		retryPending = 0;
 		agentActive = false;
@@ -510,7 +534,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 					`state: ${desired.state}${desired.message ? ` (${desired.message})` : ""}`,
 					`delivered: ${lastDelivered ? `${lastDelivered.state}${lastDelivered.message ? ` (${lastDelivered.message})` : ""}` : "never"}`,
 					`last error: ${lastError || "none"}`,
-					`metadata: ${metadataEnabled ? "on" : "off"}  display: ${displayName || "(default)"}`,
+					`metadata: ${metadataEnabled ? "on" : "off"}  display: ${displayName || "(default)"}  heartbeat: ${heartbeatMs || "off"}ms`,
 				];
 				notify(lines.join("\n"));
 			},
