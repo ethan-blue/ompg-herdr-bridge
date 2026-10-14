@@ -293,6 +293,10 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 
 	async function reportSession(source: string): Promise<boolean> {
 		if (runtimeOff) return true;
+		const ref = sessionReference();
+		// The official integration skips the report entirely without an
+		// identity; registering a session with no path/id carries no value.
+		if (!ref.agent_session_path && !ref.agent_session_id) return true;
 		const params: Record<string, unknown> = {
 			pane_id: paneId,
 			source: SOURCE,
@@ -300,7 +304,6 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 			seq: nextSeq(),
 			session_start_source: source,
 		};
-		const ref = sessionReference();
 		Object.assign(params, ref, resumeArgv(ref));
 		return enqueue("pane.report_agent_session", params);
 	}
@@ -383,7 +386,16 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------
 	pi.on("session_start", (_event, ctx) => {
 		currentSessionSource = "startup";
-		activate(ctx as unknown as BridgeContext);
+		const ctxB = ctx as unknown as BridgeContext;
+		if (!activated) {
+			activate(ctxB);
+			return;
+		}
+		// Already active (e.g. /new inside the same process): re-register,
+		// matching the official integration's unconditional reportSession.
+		activeSessionManager = ctxB.sessionManager;
+		activeModel = ctxB.model;
+		void reportSession(currentSessionSource);
 	});
 
 	pi.on("session_switch", (event, ctx) => {
@@ -403,6 +415,10 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	pi.on("agent_start", (_event, ctx) => {
 		if (!activated) activate(ctx as unknown as BridgeContext);
 		if (!activated) return;
+		// Re-register the session every turn like the official integration:
+		// herdr's agent tracking decays without periodic re-assertion.
+		activeSessionManager = (ctx as unknown as BridgeContext).sessionManager ?? activeSessionManager;
+		void reportSession(currentSessionSource);
 		agentActive = true;
 		clearIdleTimer();
 		transition();
@@ -433,13 +449,28 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		else transition();
 	});
 
+	// Cross-extension channel: other omp extensions can signal blocked state
+	// (same contract as the official integration).
+	try {
+		pi.events?.on?.("herdr:blocked", (data: { active?: boolean; label?: string }) => {
+			if (!activated) return;
+			if (data?.active === false) {
+				blockedCount = Math.max(0, blockedCount - 1);
+				if (blockedCount === 0) blockedMessage = "";
+			} else {
+				blockedCount++;
+				if (data?.label) blockedMessage = data.label;
+			}
+			transition();
+		});
+	} catch { /* event bus unavailable */ }
+
 	pi.on("tool_approval_requested", (event) => {
 		if (!activated) return;
 		blockedCount++;
-		const label = (event as { label?: string; prompt?: string; toolName?: string })?.label
-			?? (event as { toolName?: string })?.toolName
-			?? "";
-		if (blockedCount === 1 || !blockedMessage) blockedMessage = label ? `approval: ${label}` : "awaiting approval";
+		const e = event as { reason?: string; label?: string; toolName?: string };
+		const label = e?.reason ?? e?.label ?? (e?.toolName ? `${e.toolName} approval` : "Tool approval");
+		if (blockedCount === 1 || !blockedMessage) blockedMessage = label;
 		transition();
 	});
 
@@ -452,11 +483,13 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 
 	pi.on("tool_execution_start", (event) => {
 		if (!activated) return;
-		const e = event as { toolName?: string; args?: { questions?: { text?: string }[]; question?: string } };
+		const e = event as { toolName?: string; args?: { questions?: { question?: string }[]; question?: string } };
 		if (e?.toolName !== "ask") return;
 		blockedCount++;
-		const question = e.args?.questions?.[0]?.text ?? e.args?.question ?? "";
-		if (blockedCount === 1 || !blockedMessage) blockedMessage = question ? `ask: ${question}` : "asking a question";
+		const question = e.args?.questions?.find(q => typeof q?.question === "string")?.question
+			?? e.args?.question
+			?? "";
+		if (blockedCount === 1 || !blockedMessage) blockedMessage = question || "waiting for user input";
 		transition();
 	});
 
@@ -483,14 +516,8 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 		retryPending = 0;
 		agentActive = false;
 		desired = { state: "idle", message: "" };
-		// Best-effort terminal report; the pane process exits right after.
-		void send("pane.report_agent", {
-			pane_id: paneId,
-			source: SOURCE,
-			agent: AGENT,
-			state: "idle",
-			seq: nextSeq(),
-		}, SEND_TIMEOUT_MS);
+		// The official integration sends nothing on shutdown; a report against
+		// a pane being closed only produces a server-side error log line.
 	});
 
 	// ------------------------------------------------------------------
