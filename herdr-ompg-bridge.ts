@@ -17,6 +17,8 @@
 //   HERDR_OMP_BRIDGE_FORCE=1        activate even without a UI (testing)
 //   HERDR_OMP_IDLE_DEBOUNCE_MS      idle debounce, default 250
 //   HERDR_OMP_BRIDGE_METADATA=0     disable pane.report_metadata
+//   HERDR_OMP_BRIDGE_DISPLAY_NAME   display_agent shown in herdr UI, default "ompg"
+//                                    (set 0 to keep the authoritative "omp" label visible)
 //   HERDR_OMP_BRIDGE_LOG=1          verbose logging for debugging
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -71,6 +73,9 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 	const metadataEnabled = env.HERDR_OMP_BRIDGE_METADATA !== "0";
 	const verbose = env.HERDR_OMP_BRIDGE_LOG === "1";
 	const idleDebounceMs = envInt("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
+	// display_agent is a display-only override (metadata); the authoritative
+	// agent label stays "omp" so herdr keeps its built-in omp semantics.
+	const displayName = env.HERDR_OMP_BRIDGE_DISPLAY_NAME ?? "ompg";
 	const endpoint =
 		process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 	const enabled =
@@ -318,13 +323,16 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 				tokens.context = `${formatTokens(used)}/${formatTokens(window)} (${Math.round((used / window) * 100)}%)`;
 			}
 		} catch { /* usage unavailable */ }
-		if (Object.keys(tokens).length === 0) return true;
-		return enqueue("pane.report_metadata", {
+		if (Object.keys(tokens).length === 0 && !displayName) return true;
+		const params: Record<string, unknown> = {
 			pane_id: paneId,
 			source: SOURCE,
 			seq: nextSeq(),
-			tokens,
-		});
+			agent: AGENT,
+		};
+		if (displayName) params.display_agent = displayName;
+		if (Object.keys(tokens).length > 0) params.tokens = tokens;
+		return enqueue("pane.report_metadata", params);
 	}
 
 	// ------------------------------------------------------------------
@@ -502,7 +510,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI): void {
 					`state: ${desired.state}${desired.message ? ` (${desired.message})` : ""}`,
 					`delivered: ${lastDelivered ? `${lastDelivered.state}${lastDelivered.message ? ` (${lastDelivered.message})` : ""}` : "never"}`,
 					`last error: ${lastError || "none"}`,
-					`metadata: ${metadataEnabled ? "on" : "off"}`,
+					`metadata: ${metadataEnabled ? "on" : "off"}  display: ${displayName || "(default)"}`,
 				];
 				notify(lines.join("\n"));
 			},

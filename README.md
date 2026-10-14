@@ -70,6 +70,7 @@ Or manually: copy `herdr-ompg-bridge.ts` into `<config-dir>/agent/extensions/`.
 | `HERDR_OMP_BRIDGE_FORCE` | `0` | Activate even in headless/print mode (testing) |
 | `HERDR_OMP_IDLE_DEBOUNCE_MS` | `250` | Idle debounce window (same name as the bundled integration) |
 | `HERDR_OMP_BRIDGE_METADATA` | `1` | Set `0` to disable `pane.report_metadata` |
+| `HERDR_OMP_BRIDGE_DISPLAY_NAME` | `ompg` | `display_agent` shown in the herdr UI. The authoritative agent label stays `omp` (herdr's built-in semantics); set `0` to show `omp` instead |
 | `HERDR_OMP_BRIDGE_LOG` | `0` | Verbose logging |
 
 ## Offline test (no herdr needed)
