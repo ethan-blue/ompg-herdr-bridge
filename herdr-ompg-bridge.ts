@@ -23,7 +23,7 @@
 //                                    (set 0 to keep the authoritative "omp" label visible)
 //   HERDR_OMP_BRIDGE_LOG=1          verbose logging for debugging
 
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import net from "node:net";
 
 const SOURCE = "herdr:omp";
@@ -57,9 +57,7 @@ interface BridgeContext {
 				usedFraction?: number;
 		  }
 		| undefined;
-	ui?: {
-		notify?(msg: string, opts?: { level?: string }): void;
-	};
+	ui?: Pick<ExtensionUIContext, "notify">;
 }
 
 function envInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -592,7 +590,7 @@ export default function herdrOmpgBridge(pi: ExtensionAPI, env: NodeJS.ProcessEnv
 				if (stopped) return;
 				const ui = (ctx as unknown as BridgeContext).ui;
 				const notify = (msg: string) => {
-					if (ui?.notify) ui.notify(msg, { level: "info" });
+					if (ui?.notify) ui.notify(msg, "info");
 					else log.info(msg);
 				};
 				const sub = (args ?? "").trim().split(/\s+/)[0] ?? "";
